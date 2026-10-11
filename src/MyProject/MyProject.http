@@ -1,0 +1,36 @@
+@host = http://localhost:5073
+
+### List all products
+GET {{host}}/api/products
+
+### Get one product (404 if it does not exist)
+GET {{host}}/api/products/1
+
+### Create a product
+POST {{host}}/api/products
+Content-Type: application/json
+
+{"name":"Keyboard","price":49.99}
+
+### Create with invalid data (returns 400 with validation errors)
+POST {{host}}/api/products
+Content-Type: application/json
+
+{"name":"","price":-1}
+
+### Upload an image for product 1 (any file works; this sends README.web-api-controllers.md)
+POST {{host}}/api/products/1/image
+Content-Type: multipart/form-data; boundary=boundary
+
+--boundary
+Content-Disposition: form-data; name="file"; filename="readme.md"
+Content-Type: text/markdown
+
+< ../../README.web-api-controllers.md
+--boundary--
+
+### Delete a product (204, then 404 if repeated)
+DELETE {{host}}/api/products/1
+
+### OpenAPI document (Development only)
+GET {{host}}/openapi/v1.json
