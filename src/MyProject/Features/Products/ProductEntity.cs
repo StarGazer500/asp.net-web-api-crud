@@ -1,8 +1,8 @@
 using MyProject.Shared;
 
-namespace MyProject.Core.Data.Entities;
+namespace MyProject.Features.Products;
 
-public class Product : BaseEntity
+public class ProductEntity : BaseEntity
 {
     public string Name { get; set; } = "";
     public decimal Price { get; set; }

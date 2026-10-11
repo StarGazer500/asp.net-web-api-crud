@@ -4,7 +4,7 @@ Feature-based architecture with Ports and Adapters, using **controllers** as the
 
 ## 1. Overview
 
-- **Features** (`Features/`) group code by business capability (Products, Orders, ...). Each feature owns only its controller, service and DTOs.
+- **Features** (`Features/`) group code by business capability (Products, Orders, ...). Each feature owns its controller, service, DTOs and entity.
 - **Ports** (`Shared/Abstractions/`) are interfaces for external systems (file storage, email).
 - **Adapters** (`Adapters/`) implement the ports (S3, SMTP). Features never reference them.
 - **Core** (`Core/`) is app plumbing: config, DbContext, logging, error handling.
@@ -70,13 +70,14 @@ src/MyProject/
     Products/
       ProductsController.cs    (the "router")
       ProductService.cs
-      ProductDto.cs
+      ProductDtos.cs           (request and response DTOs)
+      ProductEntity.cs
     Orders/
       ...
   Core/
     Data/
       AppDbContext.cs
-      Entities/            Product.cs, ProductConfiguration.cs
+      Entities/            ProductConfiguration.cs   (EF mappings)
       Migrations/
     Errors/                GlobalExceptionHandler.cs
   Shared/
@@ -91,7 +92,7 @@ src/MyProject/
 
 | Folder | Contains | Test |
 |---|---|---|
-| `Features/` | Router, service and DTOs per business capability | "Is this specific to one business capability?" |
+| `Features/` | Router, service, DTOs and entity per business capability | "Is this specific to one business capability?" |
 | `Shared/` | Ports (interfaces), base entity, exceptions | "Do several features depend on this?" |
 | `Adapters/` | Implementations of ports for external systems | "Could I swap this for another provider or a fake?" |
 | `Core/` | DbContext, entities and their EF mappings, migrations, error handling | "Does the app need this to run, regardless of vendor?" |
@@ -180,13 +181,13 @@ public class StorageException(string message) : AppException(message);
 ```csharp
 // Core/Data/AppDbContext.cs
 using Microsoft.EntityFrameworkCore;
-using MyProject.Core.Data.Entities;
+using MyProject.Features.Products;
 
 namespace MyProject.Core.Data;
 
 public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(options)
 {
-    public DbSet<Product> Products => Set<Product>();
+    public DbSet<ProductEntity> Products => Set<ProductEntity>();
 
     protected override void OnModelCreating(ModelBuilder modelBuilder)
     {
@@ -195,32 +196,19 @@ public class AppDbContext(DbContextOptions<AppDbContext> options) : DbContext(op
 }
 ```
 
-Entities and their EF mappings live in `Core/Data/Entities/`. `ApplyConfigurationsFromAssembly` picks up every `IEntityTypeConfiguration<T>` automatically.
-
-```csharp
-// Core/Data/Entities/Product.cs
-using MyProject.Shared;
-
-namespace MyProject.Core.Data.Entities;
-
-public class Product : BaseEntity
-{
-    public string Name { get; set; } = "";
-    public decimal Price { get; set; }
-    public string? ImageKey { get; set; }
-}
-```
+Each entity lives in its feature folder (for example `Features/Products/ProductEntity.cs`), while its EF mapping lives in `Core/Data/Entities/`. `ApplyConfigurationsFromAssembly` picks up every `IEntityTypeConfiguration<T>` automatically.
 
 ```csharp
 // Core/Data/Entities/ProductConfiguration.cs
 using Microsoft.EntityFrameworkCore;
 using Microsoft.EntityFrameworkCore.Metadata.Builders;
+using MyProject.Features.Products;
 
 namespace MyProject.Core.Data.Entities;
 
-public class ProductConfiguration : IEntityTypeConfiguration<Product>
+public class ProductConfiguration : IEntityTypeConfiguration<ProductEntity>
 {
-    public void Configure(EntityTypeBuilder<Product> b)
+    public void Configure(EntityTypeBuilder<ProductEntity> b)
     {
         b.ToTable("products");
         b.Property(p => p.Name).HasMaxLength(200).IsRequired();
@@ -389,13 +377,26 @@ internal class LocalFileStorage(IOptions<StorageOptions> options) : IFileStorage
 
 The adapters are registered in `Program.cs` (see 8.7).
 
-### 8.5 Feature: Products (service)
+### 8.5 Feature: Products (entity, service)
+
+```csharp
+// Features/Products/ProductEntity.cs
+using MyProject.Shared;
+
+namespace MyProject.Features.Products;
+
+public class ProductEntity : BaseEntity
+{
+    public string Name { get; set; } = "";
+    public decimal Price { get; set; }
+    public string? ImageKey { get; set; }
+}
+```
 
 ```csharp
 // Features/Products/ProductService.cs
 using Microsoft.EntityFrameworkCore;
 using MyProject.Core.Data;
-using MyProject.Core.Data.Entities;
 using MyProject.Shared.Abstractions;
 using MyProject.Shared.Exceptions;
 
@@ -403,28 +404,50 @@ namespace MyProject.Features.Products;
 
 public class ProductService(AppDbContext db, IFileStorage storage)
 {
-    public async Task<ProductDto> GetAsync(int id, CancellationToken ct = default) =>
-        ToDto(await FindAsync(id, ct));
+    public async Task<ProductResponse> GetAsync(int id, CancellationToken ct = default) =>
+        ToResponse(await FindAsync(id, ct));
 
-    public async Task<List<ProductDto>> ListAsync(CancellationToken ct = default) =>
-        (await db.Products.AsNoTracking().ToListAsync(ct)).Select(ToDto).ToList();
+    public async Task<List<ProductResponse>> ListAsync(CancellationToken ct = default) =>
+        (await db.Products.AsNoTracking().ToListAsync(ct)).Select(ToResponse).ToList();
 
-    public async Task<ProductDto> CreateAsync(CreateProductDto dto, CancellationToken ct = default)
+    public async Task<ProductResponse> CreateAsync(CreateProductRequest request, CancellationToken ct = default)
     {
-        var product = new Product { Name = dto.Name, Price = dto.Price };
+        var product = new ProductEntity { Name = request.Name, Price = request.Price!.Value };
         db.Products.Add(product);
         await db.SaveChangesAsync(ct);
-        return ToDto(product);
+        return ToResponse(product);
     }
 
-    public async Task<ProductDto> UploadImageAsync(int id, Stream image, string fileName, CancellationToken ct = default)
+    public async Task<ProductResponse> UpdateAsync(int id, UpdateProductRequest request, CancellationToken ct = default)
+    {
+        var product = await FindAsync(id, ct);
+
+        product.Name = request.Name;
+        product.Price = request.Price!.Value;
+        product.UpdatedAt = DateTime.UtcNow;
+        await db.SaveChangesAsync(ct);
+        return ToResponse(product);
+    }
+
+    public async Task<ProductResponse> UploadImageAsync(int id, Stream image, string fileName, CancellationToken ct = default)
     {
         var product = await FindAsync(id, ct);
 
         product.ImageKey = await storage.UploadAsync(image, $"products/{id}/{Path.GetFileName(fileName)}", ct);
         product.UpdatedAt = DateTime.UtcNow;
         await db.SaveChangesAsync(ct);
-        return ToDto(product);
+        return ToResponse(product);
+    }
+
+    public async Task<(Stream Content, string FileName)> GetImageAsync(int id, CancellationToken ct = default)
+    {
+        var product = await FindAsync(id, ct);
+        if (product.ImageKey is null)
+            throw new NotFoundException($"Product {id} has no image.");
+
+        var content = await storage.DownloadAsync(product.ImageKey, ct)
+            ?? throw new NotFoundException($"Image for product {id} was not found.");
+        return (content, Path.GetFileName(product.ImageKey));
     }
 
     public async Task DeleteAsync(int id, CancellationToken ct = default)
@@ -432,13 +455,18 @@ public class ProductService(AppDbContext db, IFileStorage storage)
         var product = await FindAsync(id, ct);
         db.Products.Remove(product);
         await db.SaveChangesAsync(ct);
+
+        if (product.ImageKey is not null)
+            await storage.DeleteAsync(product.ImageKey, ct);
     }
 
-    private async Task<Product> FindAsync(int id, CancellationToken ct) =>
+    private async Task<ProductEntity> FindAsync(int id, CancellationToken ct) =>
         await db.Products.FirstOrDefaultAsync(p => p.Id == id, ct)
             ?? throw new NotFoundException($"Product {id} was not found.");
 
-    private static ProductDto ToDto(Product p) => new(p.Id, p.Name, p.Price, p.ImageKey);
+    // Clients get a URL they can call, not the internal storage key.
+    private static ProductResponse ToResponse(ProductEntity p) =>
+        new(p.Id, p.Name, p.Price, p.ImageKey is null ? null : $"/api/products/{p.Id}/image");
 }
 ```
 
@@ -446,29 +474,49 @@ The service works with `AppDbContext` directly. EF Core's `DbContext` is already
 
 ### 8.6 Feature: Products (DTOs, router)
 
+DTOs are named by direction: `<Name>Request` for what clients send, `<Name>Response` for what the API returns. All DTOs of a feature live together in `<Name>Dtos.cs`. Create and update requests are separate types even when they look alike, because they usually diverge (for example, fields that can only be set on create).
+
 ```csharp
-// Features/Products/ProductDto.cs
+// Features/Products/ProductDtos.cs
 using System.ComponentModel.DataAnnotations;
 
 namespace MyProject.Features.Products;
 
-public record ProductDto(int Id, string Name, decimal Price, string? ImageKey);
+// What the API returns.
+public record ProductResponse(int Id, string Name, decimal Price, string? ImageUrl);
 
-public class CreateProductDto
+// POST body.
+public class CreateProductRequest
 {
     [Required, MaxLength(200)]
     public string Name { get; set; } = "";
 
-    [Range(0, 1_000_000)]
-    public decimal Price { get; set; }
+    // Nullable so a missing price fails [Required] instead of silently becoming 0.
+    [Required, Range(0, 1_000_000)]
+    public decimal? Price { get; set; }
+}
+
+// PUT body.
+public class UpdateProductRequest
+{
+    [Required, MaxLength(200)]
+    public string Name { get; set; } = "";
+
+    [Required, Range(0, 1_000_000)]
+    public decimal? Price { get; set; }
 }
 ```
 
 `[ApiController]` validates these automatically and returns a 400 `ValidationProblemDetails` before your action runs.
 
+Make required numbers nullable (`decimal?` with `[Required]`). A plain `decimal` can never be missing, so an omitted `price` would silently become `0` and pass validation.
+
+The response exposes `ImageUrl` (an endpoint clients can call), not the internal storage key.
+
 ```csharp
 // Features/Products/ProductsController.cs   <- the "router"
 using Microsoft.AspNetCore.Mvc;
+using Microsoft.AspNetCore.StaticFiles;
 
 namespace MyProject.Features.Products;
 
@@ -476,26 +524,41 @@ namespace MyProject.Features.Products;
 [Route("api/products")]
 public class ProductsController(ProductService service) : ControllerBase
 {
+    private static readonly FileExtensionContentTypeProvider ContentTypes = new();
+
     [HttpGet]
-    public async Task<ActionResult<List<ProductDto>>> List(CancellationToken ct) =>
+    public async Task<ActionResult<List<ProductResponse>>> List(CancellationToken ct) =>
         Ok(await service.ListAsync(ct));
 
     [HttpGet("{id:int}")]
-    public async Task<ActionResult<ProductDto>> Get(int id, CancellationToken ct) =>
+    public async Task<ActionResult<ProductResponse>> Get(int id, CancellationToken ct) =>
         Ok(await service.GetAsync(id, ct));
 
     [HttpPost]
-    public async Task<ActionResult<ProductDto>> Create(CreateProductDto dto, CancellationToken ct)
+    public async Task<ActionResult<ProductResponse>> Create(CreateProductRequest request, CancellationToken ct)
     {
-        var created = await service.CreateAsync(dto, ct);
+        var created = await service.CreateAsync(request, ct);
         return CreatedAtAction(nameof(Get), new { id = created.Id }, created);
     }
 
+    [HttpPut("{id:int}")]
+    public async Task<ActionResult<ProductResponse>> Update(int id, UpdateProductRequest request, CancellationToken ct) =>
+        Ok(await service.UpdateAsync(id, request, ct));
+
     [HttpPost("{id:int}/image")]
-    public async Task<ActionResult<ProductDto>> UploadImage(int id, IFormFile file, CancellationToken ct)
+    public async Task<ActionResult<ProductResponse>> UploadImage(int id, IFormFile file, CancellationToken ct)
     {
         await using var stream = file.OpenReadStream();
         return Ok(await service.UploadImageAsync(id, stream, file.FileName, ct));
+    }
+
+    [HttpGet("{id:int}/image")]
+    public async Task<IActionResult> GetImage(int id, CancellationToken ct)
+    {
+        var (content, fileName) = await service.GetImageAsync(id, ct);
+        if (!ContentTypes.TryGetContentType(fileName, out var contentType))
+            contentType = "application/octet-stream";
+        return File(content, contentType);
     }
 
     [HttpDelete("{id:int}")]
@@ -614,9 +677,9 @@ In VS Code, install the **REST Client** extension and keep requests in a `reques
 ## 11. Adding a new feature (checklist)
 
 1. Create `Features/<Name>/`.
-2. Add the entity `<Name>.cs` (inheriting `BaseEntity`) and its `IEntityTypeConfiguration<T>` in `Core/Data/Entities/`, plus a `DbSet` on `AppDbContext`.
+2. Add the entity `<Name>Entity.cs` (inheriting `BaseEntity`) in the feature folder, its `IEntityTypeConfiguration<T>` in `Core/Data/Entities/`, and a `DbSet` on `AppDbContext`.
 3. Add `<Name>Service` with the business logic. It uses `AppDbContext` directly. Throw exceptions from `Shared/Exceptions`.
-4. Add DTOs. Never return entities.
+4. Add `<Name>Response` and `<Name>Request` DTOs together in `<Name>Dtos.cs`. Never return entities.
 5. Add the router file (controller or endpoints).
 6. Register the service in `Program.cs` (`builder.Services.AddScoped<<Name>Service>()`).
 7. Add a migration and update the database.
@@ -684,7 +747,7 @@ When the project grows, promote `Adapters`, `Core` and `Shared` to class librari
 
 - Folders and namespaces mirror each other (`MyProject.Features.Products`).
 - Async methods end in `Async` and accept a `CancellationToken`.
-- One public type per file, named after the file.
+- One public type per file, named after the file. Exception: a feature's DTOs share one `<Name>Dtos.cs`.
 - Adapters are `internal`; services and routers are `public`.
 - No business logic in routers, no HTTP concerns in services.
 - Do not wrap things that are already abstractions (`ILogger`) or that you will never swap.
